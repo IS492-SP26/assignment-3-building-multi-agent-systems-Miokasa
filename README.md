@@ -12,7 +12,7 @@ A multi-agent deep-research assistant for HCI topics, built with AutoGen. Four s
 
 Complete agent workflow: user query → Planner → Researcher (tool calls) → Writer → Critic → safety check → judge scoring.
 
-![System Running](pics/1systemrunning.png)
+![System Running](pics/1systemrunning.PNG) 
 
 ---
 
@@ -20,7 +20,7 @@ Complete agent workflow: user query → Planner → Researcher (tool calls) → 
 
 Each agent's output is surfaced in the CLI/UI. The Researcher emits structured `tool_call` blocks; the Planner's research plan and the Critic's evaluation are both displayed.
 
-![Agent Trace](pics/2agenttrace.png)
+![Agent Trace](pics/2agenttrace.PNG)
 
 ---
 
@@ -28,7 +28,7 @@ Each agent's output is surfaced in the CLI/UI. The Researcher emits structured `
 
 When `tavily-python` or `semanticscholar` are not installed, the system logs the error, reports `Sources gathered: 0`, and continues to produce a synthesized answer rather than crashing. This is expected behavior and is documented in the session JSON.
 
-![Tool Failure Recovery](pics/3failure.png)
+![Tool Failure Recovery](pics/3failure.PNG)
 
 ---
 
@@ -36,7 +36,7 @@ When `tavily-python` or `semanticscholar` are not installed, the system logs the
 
 Judge scores displayed after a completed run, covering Relevance, Evidence Quality, Completeness, Accuracy, and Clarity. The Critic's structured evaluation (with `TERMINATE` decision) is also shown.
 
-![Evaluation Output](pics/4evaluation.png)
+![Evaluation Output](pics/4evaluation.PNG)
 
 ---
 
@@ -44,7 +44,7 @@ Judge scores displayed after a completed run, covering Relevance, Evidence Quali
 
 Safety event log showing input/output decisions per agent, policy layer triggered, and disposition (`allowed` / `blocked` / `sanitized` / `relaxed_allowed`).
 
-![Safety Log](pics/5saftylog.png)
+![Safety Log](pics/5saftylog.PNG)
 
 ---
 
