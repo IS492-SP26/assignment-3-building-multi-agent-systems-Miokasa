@@ -83,11 +83,11 @@ async def process_query(query: str) -> Dict[str, Any]:
         if "error" in result:
             return result
         
-        # Extract citations from conversation history
-        citations = extract_citations(result)
+        # Prefer structured citations from the orchestrator, then fall back to regex extraction.
+        citations = result.get("metadata", {}).get("citations") or extract_citations(result)
         
-        # Extract agent traces for display
-        agent_traces = extract_agent_traces(result)
+        # Prefer structured traces from the orchestrator, then fall back to message previews.
+        agent_traces = result.get("metadata", {}).get("agent_traces") or extract_agent_traces(result)
         
         # Format metadata
         metadata = result.get("metadata", {})
@@ -198,6 +198,9 @@ def display_response(result: Dict[str, Any]):
     response = result.get("response", "")
     st.markdown(response)
 
+    # Display metadata
+    metadata = result.get("metadata", {})
+
     # Display citations
     citations = result.get("citations", [])
     if citations:
@@ -205,8 +208,19 @@ def display_response(result: Dict[str, Any]):
             for i, citation in enumerate(citations, 1):
                 st.markdown(f"**[{i}]** {citation}")
 
-    # Display metadata
-    metadata = result.get("metadata", {})
+    sources = metadata.get("sources", [])
+    if sources:
+        with st.expander("Sources", expanded=False):
+            for i, source in enumerate(sources, 1):
+                title = source.get("title", f"Source {i}")
+                url = source.get("url", "")
+                if url:
+                    st.markdown(f"**[{i}]** [{title}]({url})")
+                else:
+                    st.markdown(f"**[{i}]** {title}")
+
+    display_evidence_details(metadata)
+
     col1, col2 = st.columns(2)
     with col1:
         st.metric("Sources Used", metadata.get("num_sources", 0))
@@ -214,10 +228,18 @@ def display_response(result: Dict[str, Any]):
         score = metadata.get("critique_score", 0)
         st.metric("Quality Score", f"{score:.2f}")
 
+    evaluation = metadata.get("evaluation")
+    if evaluation:
+        st.metric("Evaluation Score", f"{evaluation.get('overall_score', 0.0):.3f}")
+
     # Safety events
     safety_events = metadata.get("safety_events", [])
     if safety_events:
         with st.expander("⚠️ Safety Events", expanded=True):
+            if metadata.get("refused"):
+                st.error("Response was refused by safety policy.")
+            elif metadata.get("sanitized"):
+                st.warning("Response was sanitized by safety policy.")
             for event in safety_events:
                 event_type = event.get("type", "unknown")
                 action = event.get("action", "allow")
@@ -251,7 +273,53 @@ def display_agent_traces(traces: Dict[str, Any]):
             for action in actions:
                 action_type = action.get("action_type", "unknown")
                 details = action.get("details", {})
-                st.text(f"  → {action_type}: {details}")
+                # Use code blocks for readable trace previews without changing data shape.
+                st.markdown(f"- `{action_type}`")
+                st.code(str(details), language="markdown")
+
+
+def display_evidence_details(metadata: Dict[str, Any]):
+    """Display tool traces, grouped sources, and citation mapping."""
+    evidence_strength = metadata.get("evidence_strength", "Unknown")
+    st.info(f"Evidence Strength: **{evidence_strength}**")
+
+    tool_traces = metadata.get("tool_traces", [])
+    if tool_traces:
+        with st.expander("Researcher Tool Calls", expanded=False):
+            for trace in tool_traces:
+                st.markdown(
+                    f"**[{trace.get('order', '?')}] {trace.get('tool', 'unknown')}** "
+                    f"`{trace.get('query', '')}`"
+                )
+                st.caption(trace.get("summary", ""))
+                for result in trace.get("results", [])[:5]:
+                    title = result.get("title", "Untitled")
+                    url = result.get("url", "")
+                    snippet = result.get("snippet", "")
+                    st.markdown(f"- [{title}]({url})" if url else f"- {title}")
+                    if snippet:
+                        st.caption(snippet)
+
+    source_groups = metadata.get("source_groups", {})
+    if source_groups:
+        with st.expander("Sources Grouped by Tool", expanded=False):
+            for tool, sources in source_groups.items():
+                st.markdown(f"**{tool}** ({len(sources)} source(s))")
+                for source in sources[:8]:
+                    title = source.get("title", "Untitled")
+                    url = source.get("url", "")
+                    st.markdown(f"- [{title}]({url})" if url else f"- {title}")
+
+    citation_mapping = metadata.get("citation_mapping", [])
+    if citation_mapping:
+        with st.expander("Evidence to Citation Mapping", expanded=False):
+            for mapping in citation_mapping[:8]:
+                st.markdown(f"**Claim {mapping.get('claim_id')}**: {mapping.get('claim', '')}")
+                for source in mapping.get("sources", []):
+                    title = source.get("title", "Untitled")
+                    url = source.get("url", "")
+                    tool = source.get("tool", "unknown")
+                    st.markdown(f"- `{tool}` [{title}]({url})" if url else f"- `{tool}` {title}")
 
 
 def display_sidebar():
@@ -277,7 +345,11 @@ def display_sidebar():
 
         # TODO: Get actual statistics
         st.metric("Total Queries", len(st.session_state.history))
-        st.metric("Safety Events", 0)  # TODO: Get from safety manager
+        safety_count = 0
+        orchestrator = st.session_state.get("orchestrator")
+        if orchestrator and hasattr(orchestrator, "safety_manager"):
+            safety_count = orchestrator.safety_manager.get_safety_stats().get("total_events", 0)
+        st.metric("Safety Events", safety_count)  # TODO: Get from safety manager
 
         st.divider()
 
@@ -394,7 +466,18 @@ def main():
         st.divider()
         st.markdown("### 🛡️ Safety Event Log")
         # TODO: Display safety events from safety manager
-        st.info("No safety events recorded.")
+        orchestrator = st.session_state.get("orchestrator")
+        events = []
+        if orchestrator and hasattr(orchestrator, "safety_manager"):
+            events = orchestrator.safety_manager.get_safety_events()
+        if events:
+            for event in reversed(events[-10:]):
+                st.warning(
+                    f"{event.get('timestamp', '')} - {event.get('type', 'unknown')} - "
+                    f"{len(event.get('violations', []))} violation(s)"
+                )
+        else:
+            st.info("No safety events recorded.")
 
 
 if __name__ == "__main__":

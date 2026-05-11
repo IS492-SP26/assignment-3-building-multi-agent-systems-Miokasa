@@ -170,6 +170,10 @@ class CLI:
         print(f"  System: {self.config.get('system', {}).get('name', 'Unknown')}")
         print(f"  Topic: {self.config.get('system', {}).get('topic', 'Unknown')}")
         print(f"  Model: {self.config.get('models', {}).get('default', {}).get('name', 'Unknown')}")
+        if hasattr(self.orchestrator, "safety_manager"):
+            stats = self.orchestrator.safety_manager.get_safety_stats()
+            print(f"  Safety events: {stats.get('total_events', 0)}")
+            print(f"  Safety violations: {stats.get('violations', 0)}")
 
     def _display_result(self, result: Dict[str, Any]):
         """Display query result with formatting."""
@@ -187,7 +191,8 @@ class CLI:
         print(f"\n{response}\n")
 
         # Extract and display citations from conversation
-        citations = self._extract_citations(result)
+        metadata = result.get("metadata", {})
+        citations = metadata.get("citations") or self._extract_citations(result)
         if citations:
             print("\n" + "-" * 70)
             print("📚 CITATIONS")
@@ -195,8 +200,9 @@ class CLI:
             for i, citation in enumerate(citations, 1):
                 print(f"[{i}] {citation}")
 
+        self._display_evidence(metadata)
+
         # Display metadata
-        metadata = result.get("metadata", {})
         if metadata:
             print("\n" + "-" * 70)
             print("📊 METADATA")
@@ -209,12 +215,65 @@ class CLI:
             # - Read safety metadata returned by the orchestrator
             # - Print which policy category was triggered
             # - Show whether the response was refused or sanitized
+            safety_events = metadata.get("safety_events", [])
+            if safety_events:
+                print(f"  • Safety action: {metadata.get('safety_action', 'allow')}")
+                print(f"  • Safety events: {len(safety_events)}")
+                latest_event = safety_events[-1]
+                for violation in latest_event.get("violations", []):
+                    print(f"    - {violation.get('validator', violation.get('category', 'policy'))}: {violation.get('reason', 'No reason provided')}")
+            if metadata.get("refused"):
+                print("  • Response was refused by safety policy")
+            elif metadata.get("sanitized"):
+                print("  • Response was sanitized by safety policy")
+
+            evaluation = metadata.get("evaluation")
+            if evaluation:
+                print(f"  • Evaluation score: {evaluation.get('overall_score', 0.0):.3f}")
 
         # Display conversation summary if verbose mode
         if self._should_show_traces():
             self._display_conversation_summary(result.get("conversation_history", []))
 
         print("=" * 70 + "\n")
+
+    def _display_evidence(self, metadata: Dict[str, Any]):
+        """Display tool traces, grouped sources, and citation mappings."""
+        if not metadata:
+            return
+
+        print("\n" + "-" * 70)
+        print("🔎 EVIDENCE")
+        print("-" * 70)
+        print(f"Evidence Strength: {metadata.get('evidence_strength', 'Unknown')}")
+
+        tool_traces = metadata.get("tool_traces", [])
+        if tool_traces:
+            print("\nResearcher Tool Calls:")
+            for trace in tool_traces:
+                print(f"  [{trace.get('order', '?')}] {trace.get('tool', 'unknown')} query=\"{trace.get('query', '')}\"")
+                print(f"      {trace.get('summary', '')}")
+                for result in trace.get("results", [])[:3]:
+                    print(f"      - {result.get('title', 'Untitled')} ({result.get('url', '')})")
+
+        source_groups = metadata.get("source_groups", {})
+        if source_groups:
+            print("\nSources by Tool:")
+            for tool, sources in source_groups.items():
+                print(f"  {tool}: {len(sources)} source(s)")
+                for source in sources[:5]:
+                    print(f"    - {source.get('title', 'Untitled')} ({source.get('url', '')})")
+
+        citation_mapping = metadata.get("citation_mapping", [])
+        if citation_mapping:
+            print("\nEvidence → Citation Mapping:")
+            for mapping in citation_mapping[:5]:
+                support = ", ".join(
+                    source.get("title", "Untitled")
+                    for source in mapping.get("sources", [])[:2]
+                )
+                print(f"  Claim {mapping.get('claim_id')}: {mapping.get('claim', '')[:120]}...")
+                print(f"    Supports: {support or 'No mapped source'}")
     
     def _extract_citations(self, result: Dict[str, Any]) -> list:
         """Extract citations/URLs from conversation history."""

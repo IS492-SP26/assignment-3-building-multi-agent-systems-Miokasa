@@ -22,7 +22,16 @@ from typing import Dict, Any, List, Optional
 import logging
 import json
 import os
-from groq import Groq
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
 class LLMJudge:
@@ -55,11 +64,27 @@ class LLMJudge:
         # Each criterion has: name, weight, description
         self.criteria = config.get("evaluation", {}).get("criteria", [])
         
-        # Initialize Groq client (similar to what we tried in Lab 5)
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            self.logger.warning("GROQ_API_KEY not found in environment")
-        self.client = Groq(api_key=api_key) if api_key else None
+        # Initialize the configured judge client, with Groq as the beginner-friendly fallback.
+        self.provider = self.model_config.get("provider", "groq")
+        self.client = None
+        if self.provider == "groq":
+            api_key = os.getenv("GROQ_API_KEY")
+            if not Groq:
+                self.logger.warning("groq package not installed; judge API calls are unavailable")
+            elif not api_key:
+                self.logger.warning("GROQ_API_KEY not found in environment")
+            self.client = Groq(api_key=api_key) if Groq and api_key else None
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            if api_key and OpenAI:
+                self.client = OpenAI(api_key=api_key, base_url=base_url)
+            elif os.getenv("GROQ_API_KEY") and Groq:
+                self.logger.warning("Configured judge provider unavailable; falling back to Groq")
+                self.provider = "groq"
+                self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            else:
+                self.logger.warning("No judge API key found in environment")
         
         self.logger.info(f"LLMJudge initialized with {len(self.criteria)} criteria")
  
@@ -68,7 +93,8 @@ class LLMJudge:
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]] = None,
-        ground_truth: Optional[str] = None
+        ground_truth: Optional[str] = None,
+        evidence_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Evaluate a response using LLM-as-a-Judge.
@@ -113,7 +139,8 @@ class LLMJudge:
                 query=query,
                 response=response,
                 sources=sources,
-                ground_truth=ground_truth
+                ground_truth=ground_truth,
+                evidence_context=evidence_context,
             )
 
             results["criterion_scores"][criterion_name] = score
@@ -130,7 +157,8 @@ class LLMJudge:
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]],
-        ground_truth: Optional[str]
+        ground_truth: Optional[str],
+        evidence_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Judge a single criterion.
@@ -157,7 +185,8 @@ class LLMJudge:
             query=query,
             response=response,
             sources=sources,
-            ground_truth=ground_truth
+            ground_truth=ground_truth,
+            evidence_context=evidence_context,
         )
 
         # Call LLM API to get judgment
@@ -187,7 +216,8 @@ class LLMJudge:
         query: str,
         response: str,
         sources: Optional[List[Dict[str, Any]]],
-        ground_truth: Optional[str]
+        ground_truth: Optional[str],
+        evidence_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Create a prompt for the judge LLM.
@@ -201,14 +231,33 @@ class LLMJudge:
 
 Criterion Description: {description}
 
+Scoring Rubric:
+- 1.0 = excellent, directly satisfies the criterion with no important gaps
+- 0.7 = good, mostly satisfies the criterion with minor gaps
+- 0.4 = partial, addresses the criterion but misses important details
+- 0.0 = poor, fails the criterion or contains serious problems
+
 Query: {query}
 
 Response:
 {response}
 """
 
+        sources = self._filter_valid_sources(sources or [])
+
         if sources:
-            prompt += f"\n\nSources Used: {len(sources)} sources"
+            source_preview = "\n".join(
+                f"- [{source.get('tool', 'unknown')}] {source.get('title', 'Untitled')}: {source.get('url', '')}"
+                for source in sources[:10]
+            )
+            prompt += f"\n\nSources Used ({len(sources)}):\n{source_preview}"
+
+        if evidence_context:
+            prompt += "\n\nStructured Evidence Context:"
+            prompt += f"\nEvidence Strength: {evidence_context.get('evidence_strength', 'Unknown')}"
+            prompt += f"\nTool Trace Summary:\n{self._format_tool_traces(evidence_context.get('tool_traces', []))}"
+            prompt += f"\nCitation Mapping:\n{self._format_citation_mapping(evidence_context.get('citation_mapping', []))}"
+            prompt += f"\nAgent Trace Summary:\n{self._format_agent_trace_summary(evidence_context.get('agent_traces', {}))}"
 
         if ground_truth:
             prompt += f"\n\nExpected Response:\n{ground_truth}"
@@ -216,7 +265,7 @@ Response:
         prompt += """
 
 Please evaluate the response on a scale of 0.0 to 1.0 for this criterion.
-Provide your evaluation in the following JSON format:
+Return only valid JSON in the following format:
 {
     "score": <float between 0.0 and 1.0>,
     "reasoning": "<detailed explanation of your score>"
@@ -225,23 +274,92 @@ Provide your evaluation in the following JSON format:
 
         return prompt
 
+    def _filter_valid_sources(self, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Prevent prompt/rubric/agent text from entering judge evidence context."""
+        import re
+        filtered = []
+        seen = set()
+        for source in sources:
+            tool = source.get("tool")
+            title = str(source.get("title", "")).strip()
+            url = str(source.get("url", "")).strip()
+            paper_id = str(source.get("paper_id", "")).strip()
+            combined = f"{title} {source.get('snippet', '')}".lower()
+            if tool not in {"web_search", "paper_search"}:
+                continue
+            if not url and not paper_id:
+                continue
+            if url and not re.match(r'^https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/|$)', url):
+                continue
+            if any(term in combined for term in ["planner", "writer", "critic", "researcher", "score:", "instructions"]):
+                continue
+            key = (url or paper_id or title).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(source)
+        return filtered
+
+    def _format_tool_traces(self, tool_traces: List[Dict[str, Any]]) -> str:
+        """Format tool execution traces compactly for the judge prompt."""
+        if not tool_traces:
+            return "- No tool traces captured"
+        lines = []
+        for trace in tool_traces[:8]:
+            result_titles = [
+                result.get("title", "Untitled")
+                for result in trace.get("results", [])[:3]
+            ]
+            lines.append(
+                f"- #{trace.get('order', '?')} {trace.get('tool', 'unknown')} "
+                f"query={trace.get('query', '')!r}; results={result_titles}"
+            )
+        return "\n".join(lines)
+
+    def _format_citation_mapping(self, citation_mapping: List[Dict[str, Any]]) -> str:
+        """Format claim-to-source mappings for evidence-quality judging."""
+        if not citation_mapping:
+            return "- No citation mapping captured"
+        lines = []
+        for mapping in citation_mapping[:8]:
+            source_titles = [
+                source.get("title", "Untitled")
+                for source in mapping.get("sources", [])[:2]
+            ]
+            lines.append(
+                f"- Claim {mapping.get('claim_id')}: {mapping.get('claim', '')[:160]} "
+                f"=> sources={source_titles}"
+            )
+        return "\n".join(lines)
+
+    def _format_agent_trace_summary(self, agent_traces: Dict[str, Any]) -> str:
+        """Format agent trace counts without overwhelming the judge prompt."""
+        if not agent_traces:
+            return "- No agent traces captured"
+        return "\n".join(
+            f"- {agent}: {len(actions)} message/action(s)"
+            for agent, actions in agent_traces.items()
+        )
+
     async def _call_judge_llm(self, prompt: str) -> str:
         """
         Call LLM API to get judgment.
         Uses model configuration from config.yaml (models.judge section).
         """
         if not self.client:
-            raise ValueError("Groq client not initialized. Check GROQ_API_KEY environment variable.")
+            raise ValueError("Judge client not initialized. Check API key environment variables.")
         
         try:
             # Load model settings from config.yaml (models.judge)
             model_name = self.model_config.get("name", "llama-3.1-8b-instant")
+            if self.provider == "groq" and model_name.startswith("openai/"):
+                model_name = os.getenv("JUDGE_MODEL", "llama-3.1-8b-instant")
             temperature = self.model_config.get("temperature", 0.3)
             max_tokens = self.model_config.get("max_tokens", 1024)
             
-            self.logger.debug(f"Calling Groq API with model: {model_name}")
+            self.logger.debug(f"Calling judge API with provider={self.provider}, model={model_name}")
             
-            # Call Groq API (pattern from Lab 5)
+            # Use the same chat-completions shape for Groq and OpenAI-compatible endpoints.
             chat_completion = self.client.chat.completions.create(
                 messages=[
                     {
@@ -296,6 +414,12 @@ Provide your evaluation in the following JSON format:
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON decode error: {e}")
             self.logger.error(f"Raw judgment: {judgment[:200]}")
+            # Simple fallback: recover a numeric score if the model added prose.
+            import re
+            match = re.search(r'"?score"?\s*[:=]\s*([01](?:\.\d+)?)', judgment)
+            if match:
+                score = max(0.0, min(1.0, float(match.group(1))))
+                return score, judgment[:500]
             return 0.0, f"Error parsing judgment: Invalid JSON"
         except Exception as e:
             self.logger.error(f"Error parsing judgment: {e}")

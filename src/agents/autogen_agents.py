@@ -8,17 +8,173 @@ Based on the AutoGen literature review example:
 https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/examples/literature-review.html
 """
 
+import json
 import os
-from typing import Dict, Any, List, Optional
+import re
+import uuid
+from typing import Dict, Any, List, Optional, Sequence, Mapping, AsyncGenerator, Union
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.conditions import TextMentionTermination
+from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
+from autogen_core.tools._base import Tool, ToolSchema
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_core.models import ModelFamily
+from autogen_core.models._types import (
+    AssistantMessage,
+    CreateResult,
+    FunctionCall,
+    FunctionExecutionResultMessage,
+    LLMMessage,
+    SystemMessage,
+    UserMessage,
+)
 # Import our research tools
 from src.tools.web_search import web_search
 from src.tools.paper_search import paper_search
+
+
+class VLLMToolRoutingClient(OpenAIChatCompletionClient):
+    """
+    OpenAI-compatible client for vLLM endpoints that do not support auto tool routing.
+
+    The endpoint is called with tool_choice="none" to avoid vLLM's auto-tool parser
+    error. If the model emits an explicit tool request as text, this client converts it
+    into AutoGen FunctionCall objects so AutoGen's normal executor still runs tools.
+    """
+
+    async def create(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        tools: Sequence[Tool | ToolSchema] = [],
+        tool_choice: Tool | str = "auto",
+        json_output: bool | type | None = None,
+        extra_create_args: Mapping[str, Any] = {},
+        cancellation_token: Optional[CancellationToken] = None,
+    ) -> CreateResult:
+        result = await super().create(
+            messages,
+            tools=tools,
+            tool_choice="none" if tools else tool_choice,
+            json_output=json_output,
+            extra_create_args=extra_create_args,
+            cancellation_token=cancellation_token,
+        )
+        return self._route_text_tool_calls(result, tools)
+
+    async def create_stream(
+        self,
+        messages: Sequence[SystemMessage | UserMessage | AssistantMessage | FunctionExecutionResultMessage],
+        *,
+        tools: Sequence[Tool | ToolSchema] = [],
+        tool_choice: Tool | str = "auto",
+        json_output: bool | type | None = None,
+        extra_create_args: Mapping[str, Any] = {},
+        cancellation_token: Optional[CancellationToken] = None,
+        max_consecutive_empty_chunk_tolerance: int = 0,
+        include_usage: Optional[bool] = None,
+    ) -> AsyncGenerator[Union[str, CreateResult], None]:
+        async for chunk in super().create_stream(
+            messages,
+            tools=tools,
+            tool_choice="none" if tools else tool_choice,
+            json_output=json_output,
+            extra_create_args=extra_create_args,
+            cancellation_token=cancellation_token,
+            max_consecutive_empty_chunk_tolerance=max_consecutive_empty_chunk_tolerance,
+            include_usage=include_usage,
+        ):
+            if isinstance(chunk, CreateResult):
+                yield self._route_text_tool_calls(chunk, tools)
+            else:
+                yield chunk
+
+    def _route_text_tool_calls(
+        self,
+        result: CreateResult,
+        tools: Sequence[Tool | ToolSchema],
+    ) -> CreateResult:
+        if not tools or not isinstance(result.content, str):
+            return result
+
+        tool_names = self._tool_names(tools)
+        calls = self._parse_tool_calls(result.content, tool_names)
+        if not calls:
+            return result
+
+        # AutoGen's AssistantAgent executes FunctionCall results through its workbench.
+        return CreateResult(
+            finish_reason="function_calls",
+            content=calls,
+            usage=result.usage,
+            cached=result.cached,
+            logprobs=result.logprobs,
+            thought=result.thought,
+        )
+
+    def _tool_names(self, tools: Sequence[Tool | ToolSchema]) -> set[str]:
+        names = set()
+        for tool in tools:
+            schema = tool.schema if isinstance(tool, Tool) else tool
+            names.add(schema["name"])
+        return names
+
+    def _parse_tool_calls(self, content: str, tool_names: set[str]) -> List[FunctionCall]:
+        text = self._strip_code_fence(content.strip())
+        parsed_calls = self._parse_json_tool_calls(text, tool_names)
+        if parsed_calls:
+            return parsed_calls
+        return self._parse_function_syntax_tool_call(text, tool_names)
+
+    def _strip_code_fence(self, text: str) -> str:
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"```$", "", text).strip()
+        return text
+
+    def _parse_json_tool_calls(self, text: str, tool_names: set[str]) -> List[FunctionCall]:
+        if not text.startswith(("{", "[")):
+            return []
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+
+        raw_calls = payload if isinstance(payload, list) else payload.get("tool_calls", [payload])
+        calls = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, dict):
+                continue
+            name = raw_call.get("name") or raw_call.get("tool") or raw_call.get("function")
+            arguments = raw_call.get("arguments", raw_call.get("args", {}))
+            if name in tool_names:
+                calls.append(FunctionCall(
+                    id=f"call_{uuid.uuid4().hex}",
+                    name=name,
+                    arguments=json.dumps(arguments if isinstance(arguments, dict) else {"query": str(arguments)}),
+                ))
+        return calls
+
+    def _parse_function_syntax_tool_call(self, text: str, tool_names: set[str]) -> List[FunctionCall]:
+        for name in tool_names:
+            match = re.search(rf"{re.escape(name)}\((.*)\)", text, flags=re.DOTALL)
+            if not match:
+                continue
+            args_text = match.group(1).strip()
+            query_match = re.search(r'query\s*=\s*["\']([^"\']+)["\']', args_text)
+            if query_match:
+                arguments = {"query": query_match.group(1)}
+            else:
+                positional = re.match(r'["\']([^"\']+)["\']', args_text)
+                arguments = {"query": positional.group(1)} if positional else {}
+            return [FunctionCall(
+                id=f"call_{uuid.uuid4().hex}",
+                name=name,
+                arguments=json.dumps(arguments),
+            )]
+        return []
 
 
 def create_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
@@ -70,16 +226,16 @@ def create_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
         if not api_key:
             raise ValueError("OPENAI_API_KEY not found in environment")
         
-        return OpenAIChatCompletionClient(
-            model=model_config.get("name", "gpt-4o-mini"),
+        return VLLMToolRoutingClient(
+            model=model_config.get("name", "Qwen/Qwen3-8B"),
             api_key=api_key,
             base_url=base_url,
             model_info={
                 "vision": False,
                 "function_calling": True,
-                "json_output": True,
+                "json_output": False,
                 "family": ModelFamily.GPT_4O,
-                "structured_output": True,
+                "structured_output": False,
             },
         )
     
@@ -156,7 +312,13 @@ You have access to tools for web search and paper search. When conducting resear
 2. Look for recent, high-quality sources
 3. Extract key findings, quotes, and data
 4. Note all source URLs and citations
-5. Gather evidence that directly addresses the research query"""
+5. Gather evidence that directly addresses the research query
+
+For vLLM tool routing, request a tool by outputting only one JSON object like:
+{"tool": "web_search", "arguments": {"query": "your search query", "max_results": 5}}
+or:
+{"tool": "paper_search", "arguments": {"query": "your paper query", "year_from": 2020}}
+After the tool result is returned, summarize the evidence normally."""
 
     # Use custom prompt from config if available
     custom_prompt = agent_config.get("system_prompt", "")

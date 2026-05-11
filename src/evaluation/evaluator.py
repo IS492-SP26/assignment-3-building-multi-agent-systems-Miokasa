@@ -139,6 +139,8 @@ class SystemEvaluator:
                 # TODO: YOUR CODE HERE
                 # Need to implement this in their orchestrator
                 response_data = self.orchestrator.process_query(query)
+                if inspect.isawaitable(response_data):
+                    response_data = await response_data
                 
                 # If process_query is async, use:
                 # response_data = await self.orchestrator.process_query(query)
@@ -153,29 +155,101 @@ class SystemEvaluator:
                 }
         else:
             # Placeholder for testing without orchestrator
-            self.logger.warning("No orchestrator provided, using placeholder response")
+            self.logger.warning("No orchestrator provided, using deterministic fallback response")
             response_data = {
                 "query": query,
-                "response": "Placeholder response - orchestrator not connected",
+                "response": "Evaluation could not run the research system because no orchestrator was connected.",
                 "citations": [],
                 "metadata": {"num_sources": 0}
             }
 
-        # Evaluate response using LLM-as-a-Judge
+        metadata = response_data.get("metadata", {})
+        evidence_context = self._build_evidence_context(metadata)
+
+        # Evaluate response using LLM-as-a-Judge with traces and citation mappings.
         evaluation = await self.judge.evaluate(
             query=query,
             response=response_data.get("response", ""),
-            sources=response_data.get("metadata", {}).get("sources", []),
-            ground_truth=ground_truth
+            sources=metadata.get("sources", []),
+            ground_truth=ground_truth,
+            evidence_context=evidence_context,
         )
 
         return {
             "query": query,
             "response": response_data.get("response", ""),
             "evaluation": evaluation,
-            "metadata": response_data.get("metadata", {}),
-            "ground_truth": ground_truth
+            "metadata": metadata,
+            "evidence_context": evidence_context,
+            "ground_truth": ground_truth,
+            "expected_sources": expected_sources
         }
+
+    def _build_evidence_context(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Package evidence traces for judge prompts and reproducible reports."""
+        sources = self._filter_valid_sources(metadata.get("sources", []))
+        tool_traces = metadata.get("tool_traces", [])
+        citation_mapping = metadata.get("citation_mapping", [])
+        source_groups = self._group_sources_by_tool(sources)
+        return {
+            "num_sources": len(sources),
+            "evidence_strength": metadata.get("evidence_strength", self._calculate_evidence_strength(sources, tool_traces)),
+            "sources": sources,
+            "source_groups": source_groups,
+            "tool_traces": tool_traces,
+            "citation_mapping": citation_mapping,
+            "agent_traces": metadata.get("agent_traces", {}),
+        }
+
+    def _filter_valid_sources(self, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep only deduplicated tool-origin external sources for judging."""
+        filtered = []
+        seen = set()
+        for source in sources:
+            tool = source.get("tool")
+            title = str(source.get("title", "")).strip()
+            url = str(source.get("url", "")).strip()
+            paper_id = str(source.get("paper_id", "")).strip()
+            combined = f"{title} {source.get('snippet', '')}".lower()
+            if tool not in {"web_search", "paper_search"}:
+                continue
+            if not url and not paper_id:
+                continue
+            if url and not self._is_valid_external_url(url):
+                continue
+            if any(term in combined for term in ["planner", "writer", "critic", "researcher", "score:", "instructions"]):
+                continue
+            key = (url or paper_id or title).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(source)
+        return filtered
+
+    def _is_valid_external_url(self, url: str) -> bool:
+        """Validate URL shape for report/evaluation source inputs."""
+        import re
+        return bool(re.match(r'^https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/|$)', url))
+
+    def _group_sources_by_tool(self, sources: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """Regroup filtered sources by originating tool."""
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for source in sources:
+            groups.setdefault(source.get("tool", "unknown"), []).append(source)
+        return groups
+
+    def _calculate_evidence_strength(
+        self,
+        sources: List[Dict[str, Any]],
+        tool_traces: List[Dict[str, Any]],
+    ) -> str:
+        """Mirror orchestrator evidence labels for fallback evaluation paths."""
+        tools = {source.get("tool") for source in sources}
+        if len(sources) >= 5 and {"web_search", "paper_search"}.issubset(tools):
+            return "High"
+        if len(sources) >= 3 or tool_traces:
+            return "Medium"
+        return "Low"
 
     def _load_test_queries(self, path: str) -> List[Dict[str, Any]]:
         """
@@ -192,6 +266,18 @@ class SystemEvaluator:
 
         with open(path_obj, 'r') as f:
             queries = json.load(f)
+
+        # Validate a small, beginner-friendly schema for each query record.
+        if not isinstance(queries, list):
+            self.logger.warning("Test query file must contain a list of query objects")
+            return []
+        valid_queries = []
+        for item in queries:
+            if isinstance(item, dict) and item.get("query"):
+                valid_queries.append(item)
+            else:
+                self.logger.warning(f"Skipping invalid test query entry: {item}")
+        queries = valid_queries
 
         # Limit number of queries if configured in config.yaml
         if self.max_test_queries and len(queries) > self.max_test_queries:
@@ -221,10 +307,16 @@ class SystemEvaluator:
         # Aggregate scores
         criterion_scores = {}
         overall_scores = []
+        source_counts = []
+        evidence_strength_counts = {"High": 0, "Medium": 0, "Low": 0}
 
         for result in successful:
             evaluation = result.get("evaluation", {})
             overall_scores.append(evaluation.get("overall_score", 0.0))
+            evidence_context = result.get("evidence_context", {})
+            source_counts.append(evidence_context.get("num_sources", 0))
+            strength = evidence_context.get("evidence_strength", "Low")
+            evidence_strength_counts[strength] = evidence_strength_counts.get(strength, 0) + 1
 
             # Collect scores by criterion
             for criterion, score_data in evaluation.get("criterion_scores", {}).items():
@@ -234,6 +326,7 @@ class SystemEvaluator:
 
         # Calculate averages
         avg_overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0.0
+        avg_sources = sum(source_counts) / len(source_counts) if source_counts else 0.0
 
         avg_criterion_scores = {}
         for criterion, scores in criterion_scores.items():
@@ -242,6 +335,24 @@ class SystemEvaluator:
         # Find best and worst
         best_result = max(successful, key=lambda r: r.get("evaluation", {}).get("overall_score", 0.0)) if successful else None
         worst_result = min(successful, key=lambda r: r.get("evaluation", {}).get("overall_score", 0.0)) if successful else None
+
+        # Keep error analysis simple: surface failed queries and low-scoring criteria.
+        low_score_threshold = 0.5
+        low_scoring_queries = [
+            {
+                "query": r.get("query", ""),
+                "score": r.get("evaluation", {}).get("overall_score", 0.0)
+            }
+            for r in successful
+            if r.get("evaluation", {}).get("overall_score", 0.0) < low_score_threshold
+        ]
+        failed_queries = [
+            {
+                "query": r.get("query", ""),
+                "error": r.get("error", "Unknown error")
+            }
+            for r in failed
+        ]
 
         report = {
             "timestamp": datetime.now().isoformat(),
@@ -255,6 +366,12 @@ class SystemEvaluator:
                 "overall_average": avg_overall,
                 "by_criterion": avg_criterion_scores
             },
+            "evidence": {
+                "average_sources_per_query": avg_sources,
+                "min_sources": min(source_counts) if source_counts else 0,
+                "max_sources": max(source_counts) if source_counts else 0,
+                "strength_counts": evidence_strength_counts,
+            },
             "best_result": {
                 "query": best_result.get("query", "") if best_result else "",
                 "score": best_result.get("evaluation", {}).get("overall_score", 0.0) if best_result else 0.0
@@ -263,6 +380,10 @@ class SystemEvaluator:
                 "query": worst_result.get("query", "") if worst_result else "",
                 "score": worst_result.get("evaluation", {}).get("overall_score", 0.0) if worst_result else 0.0
             } if worst_result else None,
+            "error_analysis": {
+                "low_scoring_queries": low_scoring_queries,
+                "failed_queries": failed_queries,
+            },
             "detailed_results": self.results
         }
 
@@ -304,9 +425,21 @@ class SystemEvaluator:
             scores = report.get("scores", {})
             f.write(f"Overall Average Score: {scores.get('overall_average', 0.0):.3f}\n\n")
 
+            evidence = report.get("evidence", {})
+            f.write("Evidence Summary:\n")
+            f.write(f"  Average Sources per Query: {evidence.get('average_sources_per_query', 0.0):.2f}\n")
+            f.write(f"  Min Sources: {evidence.get('min_sources', 0)}\n")
+            f.write(f"  Max Sources: {evidence.get('max_sources', 0)}\n")
+            f.write(f"  Evidence Strength Counts: {evidence.get('strength_counts', {})}\n\n")
+
             f.write("Scores by Criterion:\n")
             for criterion, score in scores.get("by_criterion", {}).items():
                 f.write(f"  {criterion}: {score:.3f}\n")
+
+            error_analysis = report.get("error_analysis", {})
+            f.write("\nError Analysis:\n")
+            f.write(f"  Low-scoring queries: {len(error_analysis.get('low_scoring_queries', []))}\n")
+            f.write(f"  Failed queries: {len(error_analysis.get('failed_queries', []))}\n")
 
         self.logger.info(f"Summary saved to {summary_file}")
 
@@ -381,7 +514,7 @@ async def example_simple_evaluation():
     evaluator = SystemEvaluator(config, orchestrator=None)
     
     print("\nRunning evaluation on test queries...")
-    print("Note: Using placeholder responses since no orchestrator is connected\n")
+    print("Note: Using deterministic fallback responses since no orchestrator is connected\n")
     
     # Run evaluation
     report = await evaluator.evaluate_system(str(test_file))
